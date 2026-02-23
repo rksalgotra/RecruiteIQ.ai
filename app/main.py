@@ -1,13 +1,12 @@
-import uuid
 import time
 import logging
-from typing import Callable, List
+import hashlib
+from typing import List
 
-from fastapi import FastAPI, Request, Response, Depends, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import delete
 
 from core.embedding_service import generate_embedding
@@ -18,6 +17,7 @@ from core.models_db import (
     Job,
     JobSkill,
     ResumeSkill,
+    Application,   # ✅ NEW
 )
 from core.vector_search import find_similar_resumes
 from core.skill_service import extract_skills_from_text
@@ -27,27 +27,45 @@ from core.skill_service import extract_skills_from_text
 # App Initialization
 # ============================================================
 
-app = FastAPI(title="TalentAIQ - Enterprise Edition", version="3.0.0")
+app = FastAPI(title="TalentAIQ - Enterprise Edition", version="3.2.0")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("talentaiq")
 
 
 # ============================================================
+# METRICS
+# ============================================================
+
+resume_ingestion_counter = Counter(
+    "resume_ingested_total",
+    "Total number of resumes ingested"
+)
+
+embedding_latency_histogram = Histogram(
+    "embedding_generation_seconds",
+    "Time spent generating embeddings"
+)
+
+resume_request_latency = Histogram(
+    "resume_request_seconds",
+    "Total resume ingestion request time"
+)
+
+
+# ============================================================
 # API MODELS
 # ============================================================
 
-class MatchRequest(BaseModel):
+class ResumeCreateRequest(BaseModel):
     candidate_name: str
     skills: List[str]
     experience_years: int
 
 
 class ResumeStoreResponse(BaseModel):
+    resume_id: int
     candidate_name: str
-    rule_score: float
-    vector_score: float
-    hybrid_score: float
     category: str
     explanation: str
 
@@ -62,6 +80,10 @@ class JobResponse(BaseModel):
     title: str
 
 
+class ApplyRequest(BaseModel):
+    resume_id: int
+
+
 class RankedCandidate(BaseModel):
     resume_id: int
     candidate_name: str
@@ -72,11 +94,13 @@ class RankedCandidate(BaseModel):
 
 
 # ============================================================
-# MATCH ENDPOINT (Resume Creation)
+# RESUME INGESTION
 # ============================================================
 
 @app.post("/api/v1/resume", response_model=ResumeStoreResponse)
-async def match_candidate(payload: MatchRequest, db: Session = Depends(get_db)):
+async def store_resume(payload: ResumeCreateRequest, db: Session = Depends(get_db)):
+
+    request_start = time.time()
 
     resume_text = (
         f"{payload.candidate_name}. "
@@ -84,7 +108,23 @@ async def match_candidate(payload: MatchRequest, db: Session = Depends(get_db)):
         f"Experience: {payload.experience_years} years."
     )
 
+    resume_hash = hashlib.sha256(resume_text.encode()).hexdigest()
+
+    existing_resume = db.query(Resume).filter(
+        Resume.raw_text == resume_text
+    ).first()
+
+    if existing_resume:
+        return ResumeStoreResponse(
+            resume_id=existing_resume.id,
+            candidate_name=existing_resume.candidate_name,
+            category="Duplicate Resume",
+            explanation="Resume already exists in system.",
+        )
+
+    embed_start = time.time()
     embedding = generate_embedding(resume_text)
+    embedding_latency_histogram.observe(time.time() - embed_start)
 
     resume = Resume(
         candidate_name=payload.candidate_name,
@@ -95,18 +135,18 @@ async def match_candidate(payload: MatchRequest, db: Session = Depends(get_db)):
     db.add(resume)
     db.flush()
 
-    # 🔥 Structured Skill Mapping
     matched_skills = extract_skills_from_text(resume_text, db)
     for skill in matched_skills:
         db.add(ResumeSkill(resume_id=resume.id, skill_id=skill.id))
 
     db.commit()
 
-    return MatchResponse(
+    resume_ingestion_counter.inc()
+    resume_request_latency.observe(time.time() - request_start)
+
+    return ResumeStoreResponse(
+        resume_id=resume.id,
         candidate_name=payload.candidate_name,
-        rule_score=0.0,
-        vector_score=0.0,
-        hybrid_score=0.0,
         category="Resume Stored",
         explanation="Resume successfully stored with structured skills.",
     )
@@ -131,7 +171,6 @@ async def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
     db.add(job)
     db.flush()
 
-    # 🔥 Structured Skill Mapping
     matched_skills = extract_skills_from_text(job_text, db)
     for skill in matched_skills:
         db.add(JobSkill(job_id=job.id, skill_id=skill.id))
@@ -142,7 +181,43 @@ async def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
 
 
 # ============================================================
-# JOB RANKING (Hybrid Intelligence)
+# APPLY TO JOB (NEW)
+# ============================================================
+
+@app.post("/api/v1/job/{job_id}/apply")
+async def apply_to_job(job_id: int, payload: ApplyRequest, db: Session = Depends(get_db)):
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    resume = db.query(Resume).filter(Resume.id == payload.resume_id).first()
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    existing = db.query(Application).filter(
+        Application.job_id == job_id,
+        Application.resume_id == payload.resume_id
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Resume already applied to this job"
+        )
+
+    db.add(Application(
+        job_id=job_id,
+        resume_id=payload.resume_id
+    ))
+
+    db.commit()
+
+    return {"message": "Application submitted successfully"}
+
+
+# ============================================================
+# JOB RANKING (Applicants Only + Optimized)
 # ============================================================
 
 @app.get("/api/v1/job/{job_id}/rank", response_model=List[RankedCandidate])
@@ -152,43 +227,52 @@ async def rank_candidates_for_job(job_id: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    resumes = db.query(Resume).all()
-    if not resumes:
+    # ✅ Fetch only applied resumes (optimized join)
+    applications = db.query(Application).options(
+        joinedload(Application.resume)
+    ).filter(
+        Application.job_id == job_id
+    ).all()
+
+    if not applications:
         return []
 
-    # Remove previous scores for this job
+    resumes = [app.resume for app in applications]
+
     db.execute(delete(CandidateScore).where(CandidateScore.job_id == job_id))
     db.commit()
 
-    # 🔥 Get similarity results
     similarity_results = find_similar_resumes(db, job.embedding, limit=10000)
 
-    if not similarity_results:
-        return []
-
-    # 🔥 Normalize embedding scores
-    raw_scores = [row[2] for row in similarity_results]
-    max_score = max(raw_scores)
-    min_score = min(raw_scores)
+    raw_scores = [row[2] for row in similarity_results] if similarity_results else []
+    max_score = max(raw_scores) if raw_scores else 1
+    min_score = min(raw_scores) if raw_scores else 0
 
     def normalize(score):
         if max_score == min_score:
             return 1.0
         return (score - min_score) / (max_score - min_score)
 
-    similarity_map = {row[0]: normalize(row[2]) for row in similarity_results}
+    similarity_map = {
+        row[0]: normalize(row[2])
+        for row in similarity_results
+    }
 
-    # 🔥 Get job skills
     job_skill_ids = {
         js.skill_id
-        for js in db.query(JobSkill).filter(JobSkill.job_id == job_id).all()
+        for js in db.query(JobSkill).filter(
+            JobSkill.job_id == job_id
+        ).all()
     }
 
     ranked: List[RankedCandidate] = []
 
     for resume in resumes:
 
-        embedding_score = round(float(similarity_map.get(resume.id, 0.0)), 3)
+        embedding_score = round(
+            float(similarity_map.get(resume.id, 0.0)),
+            3
+        )
 
         resume_skill_ids = {
             rs.skill_id
@@ -201,9 +285,11 @@ async def rank_candidates_for_job(job_id: int, db: Session = Depends(get_db)):
             skill_score = 0.0
         else:
             overlap = job_skill_ids.intersection(resume_skill_ids)
-            skill_score = round(len(overlap) / len(job_skill_ids), 3)
+            skill_score = round(
+                len(overlap) / len(job_skill_ids),
+                3
+            )
 
-        # 🔥 Balanced hybrid
         hybrid_score = round(
             (0.5 * embedding_score) + (0.5 * skill_score),
             3

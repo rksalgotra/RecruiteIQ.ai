@@ -1,20 +1,31 @@
+# core/vector_search.py
+
+import numpy as np
 from sqlalchemy.orm import Session
-from sqlalchemy import select
 from core.models_db import Resume
 
 
-def find_similar_resumes(db: Session, embedding: list, limit: int = 5):
+def cosine_similarity(a, b):
+    a = np.array(a)
+    b = np.array(b)
 
-    stmt = (
-        select(
-            Resume.id,
-            Resume.candidate_name,
-            (1 - Resume.embedding.cosine_distance(embedding)).label("similarity")
-        )
-        .order_by(Resume.embedding.cosine_distance(embedding))
-        .limit(limit)
-    )
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+        return 0.0
 
-    result = db.execute(stmt)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-    return result.all()
+
+def find_similar_resumes(db: Session, job_embedding, limit: int = 100):
+
+    resumes = db.query(Resume).all()
+
+    results = []
+
+    for resume in resumes:
+        similarity = cosine_similarity(job_embedding, resume.embedding)
+        results.append((resume.id, resume, similarity))
+
+    # Sort descending by similarity
+    results.sort(key=lambda x: x[2], reverse=True)
+
+    return results[:limit]
