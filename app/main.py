@@ -3,144 +3,38 @@ import time
 import logging
 from typing import Callable, List
 
-from fastapi import FastAPI, Request, Response, Depends
+from fastapi import FastAPI, Request, Response, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import delete
 
 from core.embedding_service import generate_embedding
 from core.database import get_db
-from core.models_db import Resume, CandidateScore
-
-# ==============================
-# Prometheus
-# ==============================
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-
-# ==============================
-# Rate Limiting
-# ==============================
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-
-# ==============================
-# OpenTelemetry
-# ==============================
-from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from core.models_db import (
+    Resume,
+    CandidateScore,
+    Job,
+    JobSkill,
+    ResumeSkill,
+)
+from core.vector_search import find_similar_resumes
+from core.skill_service import extract_skills_from_text
 
 
 # ============================================================
 # App Initialization
 # ============================================================
 
-app = FastAPI(
-    title="TalentAIQ - Enterprise Edition",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ============================================================
-# Logging
-# ============================================================
+app = FastAPI(title="TalentAIQ - Enterprise Edition", version="3.0.0")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("talentaiq")
 
-# ============================================================
-# Correlation Middleware
-# ============================================================
-
-@app.middleware("http")
-async def correlation_middleware(request: Request, call_next: Callable):
-    correlation_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
-    request.state.correlation_id = correlation_id
-
-    start_time = time.time()
-    response: Response = await call_next(request)
-    duration = round(time.time() - start_time, 4)
-
-    response.headers["X-Correlation-ID"] = correlation_id
-
-    logger.info(
-        {
-            "event": "request_completed",
-            "correlation_id": correlation_id,
-            "path": request.url.path,
-            "duration_sec": duration,
-            "status_code": response.status_code,
-        }
-    )
-
-    return response
-
 
 # ============================================================
-# Rate Limiting
-# ============================================================
-
-limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
-app.state.limiter = limiter
-app.add_middleware(SlowAPIMiddleware)
-
-
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": "RATE_LIMIT_EXCEEDED",
-            "correlation_id": getattr(request.state, "correlation_id", None),
-        },
-    )
-
-
-# ============================================================
-# Telemetry
-# ============================================================
-
-resource = Resource(attributes={"service.name": "talentaiq-api"})
-provider = TracerProvider(resource=resource)
-trace.set_tracer_provider(provider)
-provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
-FastAPIInstrumentor.instrument_app(app)
-tracer = trace.get_tracer(__name__)
-
-
-# ============================================================
-# Metrics
-# ============================================================
-
-REQUEST_COUNT = Counter("talentaiq_requests_total", "Total requests", ["endpoint"])
-REQUEST_LATENCY = Histogram("talentaiq_request_latency_seconds", "Latency", ["endpoint"])
-ERROR_COUNT = Counter("talentaiq_errors_total", "Total errors", ["error_type"])
-
-
-@app.get("/metrics")
-async def metrics():
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-
-# ============================================================
-# API Models
+# API MODELS
 # ============================================================
 
 class MatchRequest(BaseModel):
@@ -149,128 +43,201 @@ class MatchRequest(BaseModel):
     experience_years: int
 
 
-class MatchResponse(BaseModel):
+class ResumeStoreResponse(BaseModel):
     candidate_name: str
-    score: float
+    rule_score: float
+    vector_score: float
+    hybrid_score: float
     category: str
     explanation: str
 
 
+class JobCreateRequest(BaseModel):
+    title: str
+    description: str
+
+
+class JobResponse(BaseModel):
+    job_id: int
+    title: str
+
+
+class RankedCandidate(BaseModel):
+    resume_id: int
+    candidate_name: str
+    embedding_score: float
+    rule_score: float
+    hybrid_score: float
+    category: str
+
+
 # ============================================================
-# Scoring Engine
+# MATCH ENDPOINT (Resume Creation)
 # ============================================================
 
-class ScoringEngine:
+@app.post("/api/v1/resume", response_model=ResumeStoreResponse)
+async def match_candidate(payload: MatchRequest, db: Session = Depends(get_db)):
 
-    @staticmethod
-    def calculate_score(payload: MatchRequest) -> MatchResponse:
+    resume_text = (
+        f"{payload.candidate_name}. "
+        f"Skills: {', '.join(payload.skills)}. "
+        f"Experience: {payload.experience_years} years."
+    )
 
-        normalized_skills = [s.lower() for s in payload.skills]
-        score = 0.5
-        skill_hits = []
+    embedding = generate_embedding(resume_text)
 
-        if "aws" in normalized_skills:
-            score += 0.2
-            skill_hits.append("AWS")
+    resume = Resume(
+        candidate_name=payload.candidate_name,
+        raw_text=resume_text,
+        embedding=embedding,
+    )
 
-        if "python" in normalized_skills:
-            score += 0.15
-            skill_hits.append("Python")
+    db.add(resume)
+    db.flush()
 
-        if "docker" in normalized_skills:
-            score += 0.1
-            skill_hits.append("Docker")
+    # 🔥 Structured Skill Mapping
+    matched_skills = extract_skills_from_text(resume_text, db)
+    for skill in matched_skills:
+        db.add(ResumeSkill(resume_id=resume.id, skill_id=skill.id))
 
-        if payload.experience_years >= 5:
-            score += 0.05
+    db.commit()
 
-        score = round(min(score, 1.0), 2)
+    return MatchResponse(
+        candidate_name=payload.candidate_name,
+        rule_score=0.0,
+        vector_score=0.0,
+        hybrid_score=0.0,
+        category="Resume Stored",
+        explanation="Resume successfully stored with structured skills.",
+    )
 
-        if score >= 0.85:
-            category = "Strong Match"
-        elif score >= 0.65:
-            category = "Moderate Match"
+
+# ============================================================
+# JOB CREATION
+# ============================================================
+
+@app.post("/api/v1/job", response_model=JobResponse)
+async def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
+
+    job_text = f"{payload.title}. {payload.description}"
+    embedding = generate_embedding(job_text)
+
+    job = Job(
+        title=payload.title,
+        description=payload.description,
+        embedding=embedding,
+    )
+
+    db.add(job)
+    db.flush()
+
+    # 🔥 Structured Skill Mapping
+    matched_skills = extract_skills_from_text(job_text, db)
+    for skill in matched_skills:
+        db.add(JobSkill(job_id=job.id, skill_id=skill.id))
+
+    db.commit()
+
+    return JobResponse(job_id=job.id, title=job.title)
+
+
+# ============================================================
+# JOB RANKING (Hybrid Intelligence)
+# ============================================================
+
+@app.get("/api/v1/job/{job_id}/rank", response_model=List[RankedCandidate])
+async def rank_candidates_for_job(job_id: int, db: Session = Depends(get_db)):
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    resumes = db.query(Resume).all()
+    if not resumes:
+        return []
+
+    # Remove previous scores for this job
+    db.execute(delete(CandidateScore).where(CandidateScore.job_id == job_id))
+    db.commit()
+
+    # 🔥 Get similarity results
+    similarity_results = find_similar_resumes(db, job.embedding, limit=10000)
+
+    if not similarity_results:
+        return []
+
+    # 🔥 Normalize embedding scores
+    raw_scores = [row[2] for row in similarity_results]
+    max_score = max(raw_scores)
+    min_score = min(raw_scores)
+
+    def normalize(score):
+        if max_score == min_score:
+            return 1.0
+        return (score - min_score) / (max_score - min_score)
+
+    similarity_map = {row[0]: normalize(row[2]) for row in similarity_results}
+
+    # 🔥 Get job skills
+    job_skill_ids = {
+        js.skill_id
+        for js in db.query(JobSkill).filter(JobSkill.job_id == job_id).all()
+    }
+
+    ranked: List[RankedCandidate] = []
+
+    for resume in resumes:
+
+        embedding_score = round(float(similarity_map.get(resume.id, 0.0)), 3)
+
+        resume_skill_ids = {
+            rs.skill_id
+            for rs in db.query(ResumeSkill).filter(
+                ResumeSkill.resume_id == resume.id
+            ).all()
+        }
+
+        if not job_skill_ids:
+            skill_score = 0.0
         else:
-            category = "Weak Match"
+            overlap = job_skill_ids.intersection(resume_skill_ids)
+            skill_score = round(len(overlap) / len(job_skill_ids), 3)
 
-        explanation = (
-            f"Matched skills: {', '.join(skill_hits) if skill_hits else 'None'}. "
-            f"Experience: {payload.experience_years} years."
+        # 🔥 Balanced hybrid
+        hybrid_score = round(
+            (0.5 * embedding_score) + (0.5 * skill_score),
+            3
         )
 
-        return MatchResponse(
-            candidate_name=payload.candidate_name,
-            score=score,
+        category = (
+            "Strong Match" if hybrid_score >= 0.7 else
+            "Moderate Match" if hybrid_score >= 0.4 else
+            "Weak Match"
+        )
+
+        db.add(CandidateScore(
+            job_id=job_id,
+            resume_id=resume.id,
+            skill_score=skill_score,
+            embedding_score=embedding_score,
+            experience_score=0.0,
+            final_score=hybrid_score,
             category=category,
-            explanation=explanation,
+        ))
+
+        ranked.append(
+            RankedCandidate(
+                resume_id=resume.id,
+                candidate_name=resume.candidate_name,
+                embedding_score=embedding_score,
+                rule_score=skill_score,
+                hybrid_score=hybrid_score,
+                category=category,
+            )
         )
 
+    db.commit()
 
-# ============================================================
-# Match Endpoint
-# ============================================================
+    ranked.sort(key=lambda x: x.hybrid_score, reverse=True)
 
-@app.post("/api/v1/match", response_model=MatchResponse)
-@limiter.limit("20/minute")
-async def match_candidate(
-    request: Request,
-    payload: MatchRequest,
-    db: Session = Depends(get_db),
-):
-
-    endpoint_label = "match_v1"
-
-    with tracer.start_as_current_span("candidate_match_operation"):
-        REQUEST_COUNT.labels(endpoint=endpoint_label).inc()
-        start_time = time.time()
-
-        try:
-            # Step 1: Rule-based scoring
-            response = ScoringEngine.calculate_score(payload)
-
-            # Step 2: Generate real embedding
-            resume_text = (
-                f"{payload.candidate_name}. "
-                f"Skills: {', '.join(payload.skills)}. "
-                f"Experience: {payload.experience_years} years."
-            )
-
-            resume_embedding = generate_embedding(resume_text)
-
-            # Debug (safe to remove later)
-            print("DEBUG EMBEDDING FROM API:", resume_embedding[:5])
-
-            # Step 3: Persist Resume
-            resume_obj = Resume(
-                candidate_name=payload.candidate_name,
-                raw_text=resume_text,
-                embedding=resume_embedding,
-            )
-
-            db.add(resume_obj)
-            db.flush()
-
-            # Step 4: Persist Score
-            score_obj = CandidateScore(
-                job_id=None,
-                resume_id=resume_obj.id,
-                skill_score=response.score,
-                embedding_score=0.0,
-                experience_score=float(payload.experience_years),
-                final_score=response.score,
-                category=response.category
-            )
-
-            db.add(score_obj)
-            db.commit()
-
-            return response
-
-        except Exception as e:
-            db.rollback()
-            raise e
-
-        finally:
-            REQUEST_LATENCY.labels(endpoint=endpoint_label).observe(
-                time.time() - start_time
-            )
+    return ranked
