@@ -3,10 +3,15 @@ import time
 import logging
 from typing import Callable, List
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from core.embedding_service import generate_embedding
+from core.database import get_db
+from core.models_db import Resume, CandidateScore
 
 # ==============================
 # Prometheus
@@ -30,16 +35,14 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
+
 # ============================================================
 # App Initialization
 # ============================================================
 
 app = FastAPI(
-    title="RecruitIQ - Enterprise Edition",
+    title="TalentAIQ - Enterprise Edition",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
 )
 
 app.add_middleware(
@@ -51,14 +54,14 @@ app.add_middleware(
 )
 
 # ============================================================
-# Logging Setup
+# Logging
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("recruitiq")
+logger = logging.getLogger("talentaiq")
 
 # ============================================================
-# Correlation ID Middleware
+# Correlation Middleware
 # ============================================================
 
 @app.middleware("http")
@@ -67,10 +70,9 @@ async def correlation_middleware(request: Request, call_next: Callable):
     request.state.correlation_id = correlation_id
 
     start_time = time.time()
-
     response: Response = await call_next(request)
-
     duration = round(time.time() - start_time, 4)
+
     response.headers["X-Correlation-ID"] = correlation_id
 
     logger.info(
@@ -78,13 +80,13 @@ async def correlation_middleware(request: Request, call_next: Callable):
             "event": "request_completed",
             "correlation_id": correlation_id,
             "path": request.url.path,
-            "method": request.method,
             "duration_sec": duration,
             "status_code": response.status_code,
         }
     )
 
     return response
+
 
 # ============================================================
 # Rate Limiting
@@ -94,108 +96,57 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={
             "error": "RATE_LIMIT_EXCEEDED",
-            "message": "Too many requests",
             "correlation_id": getattr(request.state, "correlation_id", None),
         },
     )
 
+
 # ============================================================
-# OpenTelemetry
+# Telemetry
 # ============================================================
 
-resource = Resource(attributes={"service.name": "recruitiq-api"})
+resource = Resource(attributes={"service.name": "talentaiq-api"})
 provider = TracerProvider(resource=resource)
 trace.set_tracer_provider(provider)
-
 provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
 FastAPIInstrumentor.instrument_app(app)
-
 tracer = trace.get_tracer(__name__)
 
+
 # ============================================================
-# Prometheus Metrics
+# Metrics
 # ============================================================
 
-REQUEST_COUNT = Counter(
-    "recruitiq_requests_total",
-    "Total number of requests",
-    ["endpoint"]
-)
+REQUEST_COUNT = Counter("talentaiq_requests_total", "Total requests", ["endpoint"])
+REQUEST_LATENCY = Histogram("talentaiq_request_latency_seconds", "Latency", ["endpoint"])
+ERROR_COUNT = Counter("talentaiq_errors_total", "Total errors", ["error_type"])
 
-REQUEST_LATENCY = Histogram(
-    "recruitiq_request_latency_seconds",
-    "Request latency in seconds",
-    ["endpoint"]
-)
-
-ERROR_COUNT = Counter(
-    "recruitiq_errors_total",
-    "Total number of errors",
-    ["error_type"]
-)
 
 @app.get("/metrics")
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-# ============================================================
-# Structured Errors
-# ============================================================
-
-class RecruitIQError(Exception):
-    def __init__(self, code: str, message: str):
-        self.code = code
-        self.message = message
-
-
-@app.exception_handler(RecruitIQError)
-async def recruitiq_exception_handler(request: Request, exc: RecruitIQError):
-    ERROR_COUNT.labels(error_type=exc.code).inc()
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": exc.code,
-            "message": exc.message,
-            "correlation_id": getattr(request.state, "correlation_id", None),
-        },
-    )
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    ERROR_COUNT.labels(error_type="INTERNAL_ERROR").inc()
-    logger.exception(str(exc))
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "INTERNAL_ERROR",
-            "message": "Unexpected system failure",
-            "correlation_id": getattr(request.state, "correlation_id", None),
-        },
-    )
-
-# ============================================================
-# Health Endpoint
-# ============================================================
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
+
 # ============================================================
-# API v1 Models
+# API Models
 # ============================================================
 
 class MatchRequest(BaseModel):
-    candidate_name: str = Field(..., example="Rajesh Kumar")
-    skills: List[str] = Field(..., example=["AWS", "Python", "Docker"])
-    experience_years: int = Field(..., example=5)
+    candidate_name: str
+    skills: List[str]
+    experience_years: int
 
 
 class MatchResponse(BaseModel):
@@ -204,8 +155,9 @@ class MatchResponse(BaseModel):
     category: str
     explanation: str
 
+
 # ============================================================
-# Scoring Service (Separated Cleanly)
+# Scoring Engine
 # ============================================================
 
 class ScoringEngine:
@@ -215,7 +167,6 @@ class ScoringEngine:
 
         normalized_skills = [s.lower() for s in payload.skills]
         score = 0.5
-
         skill_hits = []
 
         if "aws" in normalized_skills:
@@ -254,13 +205,18 @@ class ScoringEngine:
             explanation=explanation,
         )
 
+
 # ============================================================
-# API v1 Match Endpoint
+# Match Endpoint
 # ============================================================
 
 @app.post("/api/v1/match", response_model=MatchResponse)
 @limiter.limit("20/minute")
-async def match_candidate(request: Request, payload: MatchRequest):
+async def match_candidate(
+    request: Request,
+    payload: MatchRequest,
+    db: Session = Depends(get_db),
+):
 
     endpoint_label = "match_v1"
 
@@ -269,14 +225,50 @@ async def match_candidate(request: Request, payload: MatchRequest):
         start_time = time.time()
 
         try:
-            if not payload.candidate_name:
-                raise RecruitIQError(
-                    code="VALIDATION_ERROR",
-                    message="Candidate name missing"
-                )
-
+            # Step 1: Rule-based scoring
             response = ScoringEngine.calculate_score(payload)
+
+            # Step 2: Generate real embedding
+            resume_text = (
+                f"{payload.candidate_name}. "
+                f"Skills: {', '.join(payload.skills)}. "
+                f"Experience: {payload.experience_years} years."
+            )
+
+            resume_embedding = generate_embedding(resume_text)
+
+            # Debug (safe to remove later)
+            print("DEBUG EMBEDDING FROM API:", resume_embedding[:5])
+
+            # Step 3: Persist Resume
+            resume_obj = Resume(
+                candidate_name=payload.candidate_name,
+                raw_text=resume_text,
+                embedding=resume_embedding,
+            )
+
+            db.add(resume_obj)
+            db.flush()
+
+            # Step 4: Persist Score
+            score_obj = CandidateScore(
+                job_id=None,
+                resume_id=resume_obj.id,
+                skill_score=response.score,
+                embedding_score=0.0,
+                experience_score=float(payload.experience_years),
+                final_score=response.score,
+                category=response.category
+            )
+
+            db.add(score_obj)
+            db.commit()
+
             return response
+
+        except Exception as e:
+            db.rollback()
+            raise e
 
         finally:
             REQUEST_LATENCY.labels(endpoint=endpoint_label).observe(
