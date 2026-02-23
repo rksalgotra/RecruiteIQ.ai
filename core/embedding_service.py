@@ -1,10 +1,18 @@
+import os
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
-import numpy as np
 
-# Load model once (singleton pattern)
-model = SentenceTransformer("all-MiniLM-L6-v2")
+# Load .env file
+load_dotenv()
 
-def generate_embedding(text: str) -> list:
+# Optional: explicitly pass token
+hf_token = os.getenv("HF_TOKEN")
+model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+model = SentenceTransformer(model_name, token=hf_token)
+
+
+def generate_embedding(text: str):
     if not text:
         return None
 
