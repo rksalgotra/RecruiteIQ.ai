@@ -8,6 +8,10 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from app.routers import jobs
+
+app.include_router(jobs.router)
+
 # ==============================
 # Prometheus
 # ==============================
