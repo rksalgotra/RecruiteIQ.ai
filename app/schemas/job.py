@@ -1,127 +1,35 @@
-# schemas/job.py
-
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional
-from enum import Enum
-from .common import JobStatus
+from pydantic import BaseModel
+from typing import List
 
 
-# =========================
-# Enums
-# =========================
-
-class LocationType(str, Enum):
-    remote = "remote"
-    onsite = "onsite"
-    hybrid = "hybrid"
+class LocationSchema(BaseModel):
+    type: str
+    country: str
+    city: str
 
 
-class EmploymentType(str, Enum):
-    full_time = "full_time"
-    contract = "contract"
-    internship = "internship"
-
-
-class ExperienceLevel(str, Enum):
-    junior = "junior"
-    mid = "mid"
-    senior = "senior"
-    lead = "lead"
-
-
-# =========================
-# Nested Models
-# =========================
-
-class SalaryRange(BaseModel):
-    min: float = Field(gt=0)
-    max: float = Field(gt=0)
+class SalaryRangeSchema(BaseModel):
+    min: int
+    max: int
     currency: str
 
-    @validator("max")
-    def validate_salary(cls, v, values):
-        if "min" in values and v <= values["min"]:
-            raise ValueError("salary max must be greater than min")
-        return v
 
-
-class Location(BaseModel):
-    type: LocationType
-    country: str
-    city: Optional[str] = None
-
-
-class ScreeningQuestion(BaseModel):
+class ScreeningQuestionSchema(BaseModel):
     id: str
+    type: str
     question: str
-    type: str  # number | boolean | text | choice
-    required: bool = True
+    required: bool
 
 
-# =========================
-# Requests
-# =========================
-
-class CreateJobRequest(BaseModel):
-    external_job_id: Optional[str]
+class JobCreateSchema(BaseModel):
+    external_job_id: str
     title: str
     description: str
-    location: Location
-    employment_type: EmploymentType
-    experience_level: ExperienceLevel
-    required_skills: List[str] = Field(min_items=1)
-    nice_to_have_skills: Optional[List[str]] = []
-    salary_range: Optional[SalaryRange]
-    screening_questions: Optional[List[ScreeningQuestion]] = []
-    status: Optional[JobStatus] = JobStatus.draft
-
-
-class UpdateJobRequest(BaseModel):
-    title: Optional[str]
-    description: Optional[str]
-    required_skills: Optional[List[str]]
-    nice_to_have_skills: Optional[List[str]]
-    salary_range: Optional[SalaryRange]
-    location: Optional[Location]
-    employment_type: Optional[EmploymentType]
-    experience_level: Optional[ExperienceLevel]
-
-
-class UpdateJobStatusRequest(BaseModel):
-    status: JobStatus
-
-
-# =========================
-# Responses
-# =========================
-
-class JobStatistics(BaseModel):
-    total_applications: int
-    shortlisted_count: int
-    average_score: Optional[float] = None
-
-
-class JobResponse(BaseModel):
-    job_id: str
-    external_job_id: Optional[str]
-    title: str
-    description: str
-    location: Location
-    employment_type: EmploymentType
-    experience_level: ExperienceLevel
+    location: LocationSchema
+    employment_type: str
+    experience_level: str
     required_skills: List[str]
     nice_to_have_skills: List[str]
-    salary_range: Optional[SalaryRange]
-    status: JobStatus
-    statistics: JobStatistics
-    created_at: str
-    updated_at: str
-
-
-class JobListItemResponse(BaseModel):
-    job_id: str
-    title: str
-    status: JobStatus
-    total_applications: int
-    shortlisted_count: int
-    created_at: str
+    salary_range: SalaryRangeSchema
+    screening_questions: List[ScreeningQuestionSchema]
+    status: str

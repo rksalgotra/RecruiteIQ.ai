@@ -5,6 +5,7 @@ from sqlalchemy import Column, DateTime, Boolean
 from datetime import datetime
 
 
+
 class Base(DeclarativeBase):
     pass
 

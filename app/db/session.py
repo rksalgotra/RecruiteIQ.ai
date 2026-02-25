@@ -4,6 +4,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 
+print("Loaded config from:", settings.__class__.__module__)
+print("Has DATABASE_URL:", hasattr(settings, "DATABASE_URL"))
+print("Settings dict:", settings.__dict__)
+
+
 DATABASE_URL = settings.DATABASE_URL
 
 engine = create_engine(
